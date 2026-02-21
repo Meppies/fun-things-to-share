@@ -1,0 +1,11 @@
+{
+  "domain": "ns_reisadvies",
+  "name": "NS Reisadvies",
+  "brand_id": "ns_reisadvies",
+  "config_flow": true,
+  "documentation": "",
+  "dependencies": [],
+  "codeowners": [],
+  "version": "1.1.0",
+  "iot_class": "cloud_polling"
+}

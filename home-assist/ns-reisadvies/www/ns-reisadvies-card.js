@@ -1,0 +1,417 @@
+class NSReisadviesCard extends HTMLElement {
+  setConfig(config) {
+    this._config = { 
+      title: "NS Reisadvies", 
+      max_rows: 5, 
+      scale: 100, 
+      fav_slots: 1, 
+      fav_hours: 6,
+      ...config 
+    };
+    // Zorg dat favorites object altijd bestaat
+    if (!this.favorites) this.favorites = {};
+  }
+
+  static getConfigElement() { return document.createElement("ns-reisadvies-editor"); }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this.content) {
+      const card = document.createElement('ha-card');
+      this.content = document.createElement('div');
+      this.content.style.padding = '0'; // Padding zit in de inner container
+      card.appendChild(this.content);
+      this.appendChild(card);
+    }
+    
+    // Voer updates alleen uit als de config geladen is
+    if (this._config) {
+        this.cleanOldFavorites();
+        this.processAutoFavs();
+        this.updateContent();
+    }
+  }
+
+  // --- OUDE FUNCTIES HERSTELD ---
+
+  cleanOldFavorites() {
+    if (!this._config.fav_hours) return;
+    const nu = new Date().getTime();
+    const limitInMs = this._config.fav_hours * 60 * 60 * 1000;
+    for (const tripId in this.favorites) {
+      if (nu - this.favorites[tripId] > limitInMs) delete this.favorites[tripId];
+    }
+  }
+
+  toggleFavorite(tripId, event) {
+    event.stopPropagation();
+    if (this.favorites[tripId]) delete this.favorites[tripId];
+    else this.favorites[tripId] = new Date().getTime();
+    this.updateContent();
+  }
+
+  formatDuration(minutes) {
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return remainingMinutes === 0 ? `${hours} uur` : `${hours} uur en ${remainingMinutes} min`;
+  }
+
+  formatTime(ts) {
+    if (!ts || String(ts).includes("NaN")) return "--:--";
+    const d = new Date(ts);
+    return isNaN(d.getTime()) ? "--:--" : d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+  }
+
+  calculateDelay(p, a) {
+    if (!p || !a) return "";
+    const diff = Math.round((new Date(a) - new Date(p)) / 60000);
+    return diff > 0 ? `<span class="tl-delay">+${diff}</span>` : "";
+  }
+
+  getIcon(p) {
+    const n = (p && p.displayName) ? p.displayName.toUpperCase() : "";
+    if (n.includes("METRO")) return "mdi:subway-variant";
+    if (n.includes("BUS")) return "mdi:bus";
+    if (n.includes("TRAM")) return "mdi:tram";
+    return "mdi:train";
+  }
+
+  getCrowd(c) {
+    const colors = { 'LOW': '#4CAF50', 'MEDIUM': '#FF9800', 'HIGH': '#F44336' };
+    const color = colors[c] || '#888';
+    const n = { 'LOW': 1, 'MEDIUM': 2, 'HIGH': 3 }[c] || 0;
+    let h = '';
+    for (let i = 1; i <= 3; i++) h += `<ha-icon icon="mdi:account" style="--mdc-icon-size:16px; width:16px; color:${i <= n ? color : '#888'}; opacity:${i <= n ? 1 : 0.3}; margin-right:-8px;"></ha-icon>`;
+    return `<span style="display:inline-flex; align-items:center; margin-right:8px;">${h}</span>`;
+  }
+
+  // --- EINDE HERSTELDE FUNCTIES ---
+
+  processAutoFavs() {
+    if (!this._hass || !this._config?.entity) return;
+    const state = this._hass.states[this._config.entity];
+    if (!state?.attributes?.trips) return;
+    const dag = new Date().getDay();
+    
+    for (let i = 1; i <= (this._config.fav_slots || 1); i++) {
+      const h = this._config[`auto_hour_${i}`];
+      const m = this._config[`auto_min_${i}`];
+      const days = this._config[`auto_days_${i}`] || "";
+      if (h !== undefined && m !== undefined && days.split(',').map(Number).includes(dag)) {
+        state.attributes.trips.forEach(trip => {
+          if (!trip.legs?.[0]) return;
+          const tId = trip.legs[0].origin.plannedDateTime;
+          const tDate = new Date(tId);
+          if (Math.abs((tDate.getHours() * 60 + tDate.getMinutes()) - (parseInt(h) * 60 + parseInt(m))) <= 15) {
+            this.favorites[tId] = new Date().getTime();
+          }
+        });
+      }
+    }
+  }
+
+  updateContent() {
+    if (!this._config || !this._hass) return;
+    
+    // Header instellen op de kaart
+    const card = this.querySelector('ha-card');
+    if (card) card.header = this._config.title;
+
+    if (!this._config.entity) {
+       this.content.innerHTML = `<div style="padding: 20px; text-align: center; color: var(--primary-text-color);">
+         <b>NS Reisadvies</b><br><br>Selecteer een sensor in de editor.
+       </div>`;
+       return;
+    }
+
+    const stateObj = this._hass.states[this._config.entity];
+    if (!stateObj?.attributes?.trips) {
+      this.content.innerHTML = '<div style="padding: 20px; text-align: center;">Gegevens laden of sensor onjuist...</div>';
+      return;
+    }
+
+    const tripsToShow = stateObj.attributes.trips.filter((trip, index) => {
+      const tripId = trip.legs && trip.legs[0] ? trip.legs[0].origin.plannedDateTime : index;
+      return index < this._config.max_rows || this.favorites[tripId];
+    });
+
+    let html = `
+      <style>
+        .ns-container { font-family: sans-serif; font-size: ${this._config.scale}%; line-height: 1.4; color: var(--primary-text-color); padding: 0 16px 16px 16px; }
+        .trip-wrapper { position: relative; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--divider-color); }
+        .trip-wrapper:last-child { border-bottom: none; margin-bottom: 0; }
+        .trip-header-bar { display: flex; justify-content: flex-end; height: 30px; align-items: center; margin-bottom: 5px; }
+        .fav-heart { cursor: pointer; z-index: 10; padding: 5px; }
+        .heart-grey { color: var(--disabled-text-color); opacity: 0.3; }
+        .heart-red { color: #ff5252; opacity: 1; }
+        .tl-grid { display: grid; grid-template-columns: 75px 25px 1fr; gap: 0; }
+        .tl-time { text-align: right; font-weight: bold; font-size: 1.1em; padding-right: 12px; color: var(--primary-text-color); white-space: nowrap; }
+        .tl-delay { color: #ff5252; font-size: 0.9em; font-weight: bold; display: block; text-align: right; padding-right: 12px; margin-top: -2px; }
+        .tl-duration-small { text-align: right; font-size: 0.8em; color: var(--secondary-text-color); padding-right: 12px; height: 100%; display: flex; align-items: center; justify-content: flex-end; }
+        .tl-line-col { position: relative; display: flex; justify-content: center; }
+        .tl-dot { width: 12px; height: 12px; border-radius: 50%; background: var(--card-background-color); border: 3px solid #3b82f6; z-index: 2; margin-top: 4px; }
+        .tl-dot-fill { background: #3b82f6; }
+        .tl-line { position: absolute; top: 10px; bottom: -10px; width: 3px; background: #3b82f6; z-index: 1; }
+        .tl-info { padding-left: 12px; padding-bottom: 8px; }
+        .tl-station-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+        .tl-station-name { font-weight: bold; font-size: 1.1em; flex-grow: 1; word-break: break-word; }
+        .tl-platform { background: #003082; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.85em; white-space: nowrap; flex-shrink: 0; }
+        .tl-platform-changed { background: #db4437; }
+        .tl-travel-info { padding: 4px 0 12px 12px; font-size: 0.9em; }
+        .tl-direction-main { color: #FFC917; font-weight: bold; font-size: 1.05em; display: block; margin-bottom: 4px; }
+        .tl-train-details { color: var(--secondary-text-color); display: flex; align-items: center; flex-wrap: wrap; }
+        .detail-separator { margin: 0 6px; opacity: 0.5; font-size: 0.8em; }
+        .tl-train-meta { font-size: 0.85em; color: var(--secondary-text-color); margin-top: 4px; opacity: 0.8; }
+        .tl-wait-row { display: grid; grid-template-columns: 75px 25px 1fr; height: 30px; align-items: center; }
+        .tl-wait-line-col { display: flex; justify-content: center; }
+        .tl-wait-text { padding-left: 12px; color: var(--secondary-text-color); font-style: italic; font-size: 0.9em; display: flex; align-items: center; }
+        .cancelled { text-decoration: line-through; text-decoration-color: #ff5252; opacity: 0.7; }
+        .warning-msg { color: #ff5252; font-weight: bold; font-size: 0.9em; margin-left: 12px; text-transform: uppercase; margin-top: 8px; }
+        .direct-text { color: #4CAF50; font-weight: bold; }
+        .trip-footer { text-align: right; font-size: 0.85em; color: var(--secondary-text-color); margin-top: 4px; }
+      </style>
+      <div class="ns-container">`;
+
+    tripsToShow.forEach((trip, tIdx) => {
+      const tripId = trip.legs && trip.legs[0] ? trip.legs[0].origin.plannedDateTime : tIdx;
+      const isFav = this.favorites[tripId];
+      let dist = 0;
+      const isCancelled = trip.status === "CANCELLED";
+      const cCls = isCancelled ? "cancelled" : "";
+
+      html += `<div class="trip-wrapper">
+        <div class="trip-header-bar">
+          <div class="fav-heart ${isFav ? 'heart-red' : 'heart-grey'}" id="fav-${tIdx}">
+            <ha-icon icon="${isFav ? 'mdi:heart' : 'mdi:heart-outline'}"></ha-icon>
+          </div>
+        </div>`;
+
+      trip.legs.forEach((leg, index) => {
+        if (leg.distanceInMeters) dist += leg.distanceInMeters;
+        const tDep = this.formatTime(leg.origin.plannedDateTime);
+        const tArr = this.formatTime(leg.destination.plannedDateTime);
+        const dDep = this.calculateDelay(leg.origin.plannedDateTime, leg.origin.actualDateTime);
+        const dArr = this.calculateDelay(leg.destination.plannedDateTime, leg.destination.actualDateTime);
+        
+        let legDur = "";
+        if (leg.origin.plannedDateTime && leg.destination.plannedDateTime) {
+          const diff = Math.round((new Date(leg.destination.plannedDateTime) - new Date(leg.origin.plannedDateTime)) / 60000);
+          legDur = isNaN(diff) ? "" : `${diff} min`;
+        }
+
+        const pCls = (leg.origin.actualTrack !== leg.origin.plannedTrack && leg.origin.plannedTrack) ? 'tl-platform tl-platform-changed' : 'tl-platform';
+        const pArrCls = (leg.destination.actualTrack !== leg.destination.plannedTrack && leg.destination.plannedTrack) ? 'tl-platform tl-platform-changed' : 'tl-platform';
+        let sCount = leg.stops ? leg.stops.length - 2 : 0;
+        let sText = sCount <= 0 ? `<span class="direct-text">Direct</span>` : `<span>${sCount === 1 ? "1 tussenstop" : `${sCount} tussenstops`}</span>`;
+        
+        html += `
+          <div class="tl-grid">
+            <div><div class="tl-time ${cCls}">${tDep}</div>${dDep}</div>
+            <div class="tl-line-col"><div class="tl-dot ${index === 0 ? 'tl-dot-fill' : ''}"></div><div class="tl-line"></div></div>
+            <div class="tl-info"><div class="tl-station-header"><span class="tl-station-name ${cCls}">${leg.origin.name || "Onbekend"}</span>
+            <span class="${pCls} ${cCls}">Spoor ${leg.origin.actualTrack || leg.origin.plannedTrack || '?'}</span></div></div>
+          </div>
+          <div class="tl-grid">
+            <div class="tl-duration-small ${cCls}">${legDur}</div> 
+            <div class="tl-line-col"><div class="tl-line"></div></div>
+            <div class="tl-travel-info ${cCls}"><span class="tl-direction-main ${cCls}">${leg.direction || "Onbekend"}</span>
+              <div class="tl-train-details">${sText}<span class="detail-separator">•</span>
+              <ha-icon icon="${this.getIcon(leg.product)}" style="--mdc-icon-size:16px; margin-right:4px;"></ha-icon>${(leg.product && leg.product.displayName) || "Onbekend"}
+              <span class="detail-separator">•</span>${this.getCrowd(leg.crowdForecast)}</div>
+              <div class="tl-train-meta">${leg.name || "Onbekend"}</div>
+            </div>
+          </div>
+          <div class="tl-grid">
+            <div><div class="tl-time ${cCls}">${tArr}</div>${dArr}</div>
+            <div class="tl-line-col"><div class="tl-dot ${index === trip.legs.length - 1 ? 'tl-dot-fill' : ''}"></div></div>
+            <div class="tl-info"><div class="tl-station-header"><span class="tl-station-name ${cCls}">${leg.destination.name || "Onbekend"}</span>
+            <span class="${pArrCls} ${cCls}">Spoor ${leg.destination.actualTrack || leg.destination.plannedTrack || '?'}</span></div></div>
+          </div>`;
+
+        if (index < trip.legs.length - 1) {
+          const nextLeg = trip.legs[index + 1];
+          let wMin = Math.round((new Date(nextLeg.origin.actualDateTime) - new Date(leg.destination.actualDateTime)) / 60000);
+          html += `<div class="tl-wait-row"><div></div><div class="tl-wait-line-col"><ha-icon icon="mdi:walk" style="--mdc-icon-size:16px; color:#888;"></ha-icon></div>
+          <div class="tl-wait-text ${cCls}">${isNaN(wMin) ? "Overstappen" : wMin + " min overstappen"}</div></div>`;
+        }
+      });
+      if (isCancelled) html += `<div class="warning-msg">LET OP: REIS VERVALLEN</div>`;
+      else html += `<div class="trip-footer">Totale reistijd: ${this.formatDuration(trip.actualDurationInMinutes || 0)}${dist > 0 ? ` • ${Math.round(dist / 1000)} km` : ""}</div>`;
+      
+      html += `</div>`;
+    });
+    this.content.innerHTML = html + `</div>`;
+
+    tripsToShow.forEach((trip, tIdx) => {
+      const btn = this.content.querySelector(`#fav-${tIdx}`);
+      const tripId = trip.legs && trip.legs[0] ? trip.legs[0].origin.plannedDateTime : tIdx;
+      if (btn) btn.addEventListener('click', (e) => this.toggleFavorite(tripId, e));
+    });
+  }
+}
+
+class NSReisadviesEditor extends HTMLElement {
+  setConfig(config) { if (config) this._config = config; }
+  set hass(hass) { this._hass = hass; if (!this._rendered && this._config) { this.render(); this._rendered = true; } }
+
+  render() {
+    if (!this._hass || !this._config) return;
+    const entities = Object.keys(this._hass.states).filter(e => e.startsWith('sensor.ns_')).sort();
+    const weekDays = [
+      { label: "Ma", val: 1 }, { label: "Di", val: 2 }, { label: "Wo", val: 3 },
+      { label: "Do", val: 4 }, { label: "Vr", val: 5 }, { label: "Za", val: 6 }, { label: "Zo", val: 0 }
+    ];
+    const slots = this._config.fav_slots || 1;
+    const curRows = this._config.max_rows || 5;
+    const curScale = this._config.scale || 100;
+    const curFavH = this._config.fav_hours !== undefined ? this._config.fav_hours : 6;
+    const curTitle = this._config.title || "NS Reisadvies";
+
+    let html = `
+      <style>
+        .box { background: rgba(128,128,128,0.1); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #FFC917; position: relative; }
+        .time-row { display: flex; gap: 10px; margin: 15px 0; align-items: center; }
+        .select-styled { 
+          background: #2a2a2a !important; color: white !important; padding: 6px 8px !important; height: 38px !important;
+          border-radius: 6px !important; border: 1px solid #444 !important; font-size: 1.1em !important; font-weight: 500 !important;
+          cursor: pointer !important; min-width: 70px !important; text-align: center !important;
+        }
+        .day-grid { display: flex; justify-content: space-between; margin-top: 15px; }
+        .day-unit { font-size: 0.85em; display: flex; flex-direction: column; align-items: center; gap: 5px; }
+        .chk { width: 17px; height: 17px; cursor: pointer; }
+        .slider-row { margin-bottom: 15px; }
+        .slider-label { display: block; margin-bottom: 5px; font-weight: 500; }
+        .val-span { font-weight: bold; float: right; color: #3b82f6; }
+      </style>
+      <div style="padding: 10px;">
+        <ha-textfield label="Titel" id="title" style="width:100%; margin-bottom:20px;"></ha-textfield>
+        
+        <label style="margin-bottom: 5px; display: block; font-size: 0.9em; opacity: 0.8;">Route Sensor</label>
+        <select id="entity" style="width:100%; padding:10px; background:var(--card-background-color); color:inherit; margin-bottom:20px; border:1px solid var(--divider-color); border-radius: 6px;">
+          ${entities.map(e => `<option value="${e}" ${e === this._config.entity ? "selected" : ""}>${e}</option>`).join('')}
+        </select>
+        
+        <div class="slider-row">
+           <label class="slider-label">Aantal ritten <span class="val-span" id="val-rows">${curRows}</span></label>
+           <input type="range" id="max_rows" min="1" max="15" value="${curRows}" style="width:100%;">
+        </div>
+
+        <div class="slider-row">
+           <label class="slider-label">Schaal <span class="val-span" id="val-scale">${curScale}%</span></label>
+           <input type="range" id="scale" min="50" max="150" value="${curScale}" style="width:100%;">
+        </div>
+
+        <div class="slider-row" style="margin-bottom: 25px;">
+           <label class="slider-label">Favorieten bewaren (uren) <span class="val-span" id="val-fav">${curFavH}</span></label>
+           <input type="range" id="fav_hours" min="0" max="48" value="${curFavH}" style="width:100%;">
+        </div>
+
+        <h3 style="margin-bottom: 12px; font-size: 1.1em;">Favoriete tijden</h3>`;
+
+    for (let i = 1; i <= slots; i++) {
+      const activeDays = (this._config[`auto_days_${i}`] || "").split(',').filter(x => x !== "");
+      html += `
+        <div class="box">
+          <ha-icon icon="mdi:delete" class="delete-slot" data-index="${i}" style="position: absolute; right: 10px; top: 10px; color: #ff5252; cursor: pointer; opacity: 0.7;"></ha-icon>
+          <ha-textfield label="Naam" id="auto_name_${i}" .value="${this._config[`auto_name_${i}`] || 'Tijdslot ' + i}" style="width: calc(100% - 30px); margin-bottom: 5px;"></ha-textfield>
+          
+          <div class="time-row">
+            <span>Tijd:</span>
+            <select class="select-styled" id="auto_hour_${i}">
+              ${Array.from({length:24},(_, n)=>`<option value="${n.toString().padStart(2,'0')}" ${this._config[`auto_hour_${i}`]==n.toString().padStart(2,'0')?'selected':''}>${n.toString().padStart(2,'0')}</option>`).join('')}
+            </select>
+            <span>:</span>
+            <select class="select-styled" id="auto_min_${i}">
+              ${Array.from({length:60},(_, n)=>`<option value="${n.toString().padStart(2,'0')}" ${this._config[`auto_min_${i}`]==n.toString().padStart(2,'0')?'selected':''}>${n.toString().padStart(2,'0')}</option>`).join('')}
+            </select>
+          </div>
+          
+          <div class="day-grid">
+            ${weekDays.map(day => `
+              <label class="day-unit">
+                <span>${day.label}</span>
+                <input type="checkbox" class="chk" data-index="${i}" data-day="${day.val}" ${activeDays.includes(day.val.toString()) ? 'checked' : ''}>
+              </label>
+            `).join('')}
+          </div>
+        </div>`;
+    }
+
+    html += `
+      <button id="add-slot" style="width:100%; padding: 12px; background: #3b82f6; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 5px;">
+        + Favoriete tijd toevoegen
+      </button>
+    </div>`;
+
+    this.innerHTML = html;
+
+    // FIX VOOR TITEL VELD: Zet de waarde expliciet na het renderen
+    const titleField = this.querySelector('#title');
+    if (titleField) {
+        titleField.value = curTitle;
+        titleField.addEventListener('change', (ev) => this._fire({ title: ev.target.value }));
+    }
+
+    this.querySelector('#add-slot').addEventListener('click', () => {
+      this._fire({ fav_slots: slots + 1 });
+      this.render();
+    });
+
+    this.querySelector('#max_rows').addEventListener('input', (e) => {
+        this.querySelector('#val-rows').innerText = e.target.value;
+        this._fire({ max_rows: parseInt(e.target.value) });
+    });
+    this.querySelector('#scale').addEventListener('input', (e) => {
+        this.querySelector('#val-scale').innerText = e.target.value + "%";
+        this._fire({ scale: parseInt(e.target.value) });
+    });
+    this.querySelector('#fav_hours').addEventListener('input', (e) => {
+        this.querySelector('#val-fav').innerText = e.target.value;
+        this._fire({ fav_hours: parseInt(e.target.value) });
+    });
+
+    this.querySelectorAll('.delete-slot').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = parseInt(btn.dataset.index);
+        let newConfig = { ...this._config };
+        for (let j = idx; j < slots; j++) {
+          newConfig[`auto_name_${j}`] = newConfig[`auto_name_${j+1}`];
+          newConfig[`auto_hour_${j}`] = newConfig[`auto_hour_${j+1}`];
+          newConfig[`auto_min_${j}`] = newConfig[`auto_min_${j+1}`];
+          newConfig[`auto_days_${j}`] = newConfig[`auto_days_${j+1}`];
+        }
+        delete newConfig[`auto_name_${slots}`];
+        delete newConfig[`auto_hour_${slots}`];
+        delete newConfig[`auto_min_${slots}`];
+        delete newConfig[`auto_days_${slots}`];
+        newConfig.fav_slots = slots - 1;
+        this._config = newConfig;
+        this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: newConfig } }));
+        this.render();
+      });
+    });
+
+    this.querySelectorAll('.chk').forEach(chk => {
+      chk.addEventListener('change', () => {
+        const idx = chk.dataset.index;
+        const checks = this.querySelectorAll(`.chk[data-index="${idx}"]:checked`);
+        const val = Array.from(checks).map(c => c.dataset.day).join(',');
+        this._fire({ [`auto_days_${idx}`]: val });
+      });
+    });
+
+    this.querySelectorAll('select, ha-textfield:not(#title)').forEach(el => {
+      el.addEventListener('change', (ev) => this._fire({ [ev.target.id]: ev.target.value }));
+    });
+  }
+
+  _fire(obj) {
+    const newConfig = { ...this._config, ...obj };
+    this._config = newConfig;
+    this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: newConfig } }));
+  }
+}
+
+customElements.define("ns-reisadvies-editor", NSReisadviesEditor);
+customElements.define("ns-reisadvies-card", NSReisadviesCard);
