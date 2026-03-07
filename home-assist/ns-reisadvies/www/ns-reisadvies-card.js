@@ -1,15 +1,11 @@
 class NSReisadviesCard extends HTMLElement {
   setConfig(config) {
-    this._config = { 
-      title: "NS Reisadvies", 
-      max_rows: 5, 
-      scale: 100, 
-      fav_slots: 1, 
-      fav_hours: 6,
-      ...config 
-    };
-    // Zorg dat favorites object altijd bestaat
-    if (!this.favorites) this.favorites = {};
+    this._config = { title: "NS Reisadvies", max_rows: 5, scale: 100, fav_slots: 1, ...config };
+    
+    // Tijdelijk werkgeheugen voor bliksemsnelle reacties op je kliks
+    this._pendingTrack = new Set();
+    this._pendingUntrack = new Set();
+    this._autoPinned = new Set();
   }
 
   static getConfigElement() { return document.createElement("ns-reisadvies-editor"); }
@@ -19,42 +15,87 @@ class NSReisadviesCard extends HTMLElement {
     if (!this.content) {
       const card = document.createElement('ha-card');
       this.content = document.createElement('div');
-      this.content.style.padding = '0'; // Padding zit in de inner container
+      this.content.style.padding = '0';
       card.appendChild(this.content);
       this.appendChild(card);
     }
     
-    // Voer updates alleen uit als de config geladen is
-    if (this._config) {
-        this.cleanOldFavorites();
-        this.processAutoFavs();
+    if (this._config && this._config.entity) {
         this.updateContent();
     }
   }
 
-  // --- OUDE FUNCTIES HERSTELD ---
+  toggleFavorite(ctxRecon, isCurrentlyTracked, event) {
+    event.stopPropagation();
+    if (!ctxRecon || !this._hass || !this._config.entity) return;
 
-  cleanOldFavorites() {
-    if (!this._config.fav_hours) return;
-    const nu = new Date().getTime();
-    const limitInMs = this._config.fav_hours * 60 * 60 * 1000;
-    for (const tripId in this.favorites) {
-      if (nu - this.favorites[tripId] > limitInMs) delete this.favorites[tripId];
+    if (isCurrentlyTracked) {
+      // Zet UIT: Verberg direct en vertel het de server
+      this._pendingUntrack.add(ctxRecon);
+      this._pendingTrack.delete(ctxRecon);
+      this._hass.callService("ns_reisadvies", "untrack_trip", {
+        entity_id: this._config.entity,
+        ctx_recon: ctxRecon
+      });
+    } else {
+      // Zet AAN: Toon direct en vertel het de server
+      this._pendingTrack.add(ctxRecon);
+      this._pendingUntrack.delete(ctxRecon);
+      this._hass.callService("ns_reisadvies", "track_trip", {
+        entity_id: this._config.entity,
+        ctx_recon: ctxRecon
+      });
     }
+    this.updateContent(); // Ververs het scherm direct
   }
 
-  toggleFavorite(tripId, event) {
-    event.stopPropagation();
-    if (this.favorites[tripId]) delete this.favorites[tripId];
-    else this.favorites[tripId] = new Date().getTime();
-    this.updateContent();
+  processAutoFavs(stateObj) {
+    const trackedTrips = stateObj.attributes.tracked_trips || [];
+    const dag = new Date().getDay(); // 0 is zondag, 1 is maandag, etc.
+
+    for (let i = 1; i <= (this._config.fav_slots || 1); i++) {
+      const h = this._config[`auto_hour_${i}`];
+      const m = this._config[`auto_min_${i}`];
+      const daysStr = this._config[`auto_days_${i}`] || "";
+      
+      // Veilig omzetten naar een lijst met getallen
+      const activeDays = daysStr.split(',').filter(x => x !== "").map(Number);
+
+      if (h !== undefined && m !== undefined && activeDays.includes(dag)) {
+        stateObj.attributes.trips.forEach(trip => {
+          if (!trip.legs || !trip.legs[0] || !trip.ctxRecon) return;
+          
+          const tDate = new Date(trip.legs[0].origin.plannedDateTime);
+          const tripMinutes = tDate.getHours() * 60 + tDate.getMinutes();
+          const favMinutes = parseInt(h) * 60 + parseInt(m);
+
+          // Ligt de trein binnen 15 minuten van de favoriete tijd?
+          if (Math.abs(tripMinutes - favMinutes) <= 15) {
+            
+            // Als hij nog niet op de server staat, EN we hebben hem niet al eerder doorgegeven
+            if (!trackedTrips.includes(trip.ctxRecon) && !this._autoPinned.has(trip.ctxRecon)) {
+              this._autoPinned.add(trip.ctxRecon);
+              this._pendingTrack.add(trip.ctxRecon); // Zet UI direct op rood
+              
+              this._hass.callService("ns_reisadvies", "track_trip", {
+                entity_id: this._config.entity,
+                ctx_recon: trip.ctxRecon
+              }).catch(() => {});
+              
+              // Forceer een snelle hertekening
+              setTimeout(() => this.updateContent(), 50);
+            }
+          }
+        });
+      }
+    }
   }
 
   formatDuration(minutes) {
     if (minutes < 60) return `${minutes} min`;
     const hours = Math.floor(minutes / 60);
-    const remainingMinutes = minutes % 60;
-    return remainingMinutes === 0 ? `${hours} uur` : `${hours} uur en ${remainingMinutes} min`;
+    const rem = minutes % 60;
+    return rem === 0 ? `${hours} uur` : `${hours} u ${rem} m`;
   }
 
   formatTime(ts) {
@@ -86,55 +127,53 @@ class NSReisadviesCard extends HTMLElement {
     return `<span style="display:inline-flex; align-items:center; margin-right:8px;">${h}</span>`;
   }
 
-  // --- EINDE HERSTELDE FUNCTIES ---
-
-  processAutoFavs() {
-    if (!this._hass || !this._config?.entity) return;
-    const state = this._hass.states[this._config.entity];
-    if (!state?.attributes?.trips) return;
-    const dag = new Date().getDay();
-    
-    for (let i = 1; i <= (this._config.fav_slots || 1); i++) {
-      const h = this._config[`auto_hour_${i}`];
-      const m = this._config[`auto_min_${i}`];
-      const days = this._config[`auto_days_${i}`] || "";
-      if (h !== undefined && m !== undefined && days.split(',').map(Number).includes(dag)) {
-        state.attributes.trips.forEach(trip => {
-          if (!trip.legs?.[0]) return;
-          const tId = trip.legs[0].origin.plannedDateTime;
-          const tDate = new Date(tId);
-          if (Math.abs((tDate.getHours() * 60 + tDate.getMinutes()) - (parseInt(h) * 60 + parseInt(m))) <= 15) {
-            this.favorites[tId] = new Date().getTime();
-          }
-        });
-      }
-    }
-  }
-
   updateContent() {
     if (!this._config || !this._hass) return;
     
-    // Header instellen op de kaart
     const card = this.querySelector('ha-card');
     if (card) card.header = this._config.title;
 
     if (!this._config.entity) {
-       this.content.innerHTML = `<div style="padding: 20px; text-align: center; color: var(--primary-text-color);">
-         <b>NS Reisadvies</b><br><br>Selecteer een sensor in de editor.
-       </div>`;
+       this.content.innerHTML = `<div style="padding: 20px; text-align: center; color: var(--primary-text-color);"><b>NS Reisadvies</b><br><br>Selecteer een sensor.</div>`;
        return;
     }
 
     const stateObj = this._hass.states[this._config.entity];
     if (!stateObj?.attributes?.trips) {
-      this.content.innerHTML = '<div style="padding: 20px; text-align: center;">Gegevens laden of sensor onjuist...</div>';
+      this.content.innerHTML = '<div style="padding: 20px; text-align: center;">Gegevens laden...</div>';
       return;
     }
 
-    const tripsToShow = stateObj.attributes.trips.filter((trip, index) => {
-      const tripId = trip.legs && trip.legs[0] ? trip.legs[0].origin.plannedDateTime : index;
-      return index < this._config.max_rows || this.favorites[tripId];
+    // Controleer op automatische tijd-favorieten
+    this.processAutoFavs(stateObj);
+
+    const allTrips = stateObj.attributes.trips || [];
+    const serverTracked = stateObj.attributes.tracked_trips || [];
+
+    // Verwijder 'pending' statussen als de server is bijgewerkt
+    serverTracked.forEach(ctx => this._pendingTrack.delete(ctx));
+    this._pendingUntrack.forEach(ctx => {
+       if (!serverTracked.includes(ctx)) this._pendingUntrack.delete(ctx);
     });
+
+    const tripsToShow = allTrips.filter((trip, index) => {
+      const ctx = trip.ctxRecon;
+      let isFav = false;
+      
+      if (ctx) {
+        // Is hij rood op de server, en hebben we hem niet zojuist proberen uit te zetten?
+        if (serverTracked.includes(ctx) && !this._pendingUntrack.has(ctx)) isFav = true;
+        // Of hebben we hem zojuist aangeklikt, maar is de server nog niet zo ver?
+        if (this._pendingTrack.has(ctx)) isFav = true;
+      }
+      
+      return index < this._config.max_rows || isFav;
+    });
+
+    if (tripsToShow.length === 0) {
+      this.content.innerHTML = '<div style="padding: 20px; text-align: center;">Geen ritten gevonden...</div>';
+      return;
+    }
 
     let html = `
       <style>
@@ -174,15 +213,20 @@ class NSReisadviesCard extends HTMLElement {
       <div class="ns-container">`;
 
     tripsToShow.forEach((trip, tIdx) => {
-      const tripId = trip.legs && trip.legs[0] ? trip.legs[0].origin.plannedDateTime : tIdx;
-      const isFav = this.favorites[tripId];
+      const ctx = trip.ctxRecon;
+      let isFav = false;
+      if (ctx) {
+        if (serverTracked.includes(ctx) && !this._pendingUntrack.has(ctx)) isFav = true;
+        if (this._pendingTrack.has(ctx)) isFav = true;
+      }
+      
       let dist = 0;
       const isCancelled = trip.status === "CANCELLED";
       const cCls = isCancelled ? "cancelled" : "";
 
       html += `<div class="trip-wrapper">
         <div class="trip-header-bar">
-          <div class="fav-heart ${isFav ? 'heart-red' : 'heart-grey'}" id="fav-${tIdx}">
+          <div class="fav-heart ${isFav ? 'heart-red' : 'heart-grey'}" data-idx="${tIdx}" data-ctx="${ctx || ''}" data-fav="${isFav}">
             <ha-icon icon="${isFav ? 'mdi:heart' : 'mdi:heart-outline'}"></ha-icon>
           </div>
         </div>`;
@@ -243,10 +287,12 @@ class NSReisadviesCard extends HTMLElement {
     });
     this.content.innerHTML = html + `</div>`;
 
-    tripsToShow.forEach((trip, tIdx) => {
-      const btn = this.content.querySelector(`#fav-${tIdx}`);
-      const tripId = trip.legs && trip.legs[0] ? trip.legs[0].origin.plannedDateTime : tIdx;
-      if (btn) btn.addEventListener('click', (e) => this.toggleFavorite(tripId, e));
+    // Klik-functies koppelen
+    const hearts = this.content.querySelectorAll(`.fav-heart`);
+    hearts.forEach(btn => {
+      const ctxRecon = btn.getAttribute('data-ctx');
+      const isFav = btn.getAttribute('data-fav') === 'true';
+      btn.addEventListener('click', (e) => this.toggleFavorite(ctxRecon, isFav, e));
     });
   }
 }
@@ -346,7 +392,6 @@ class NSReisadviesEditor extends HTMLElement {
 
     this.innerHTML = html;
 
-    // FIX VOOR TITEL VELD: Zet de waarde expliciet na het renderen
     const titleField = this.querySelector('#title');
     if (titleField) {
         titleField.value = curTitle;

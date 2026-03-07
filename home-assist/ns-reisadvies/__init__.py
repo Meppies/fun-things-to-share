@@ -1,18 +1,13 @@
 import logging
 import os
-from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.components.http import StaticPathConfig
 
-from .const import DOMAIN 
-
-try:
-    from .api import NSAPI
-except ImportError:
-    from api import NSAPI
+from .const import DOMAIN
+# Haal onze superslimme nieuwe coordinator op
+from .coordinator import NSUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,26 +21,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     act_station = entry.data.get("act_station")
     arr_station = entry.data.get("arr_station")
     
-    scan_interval = entry.options.get("scan_interval_minuten", 5)
-
-    api = NSAPI(api_key)
-
-    async def async_update_data():
-        try:
-            # Deze functie haalt de trips op en zorgt dat distanceInMeters mee komt
-            return await hass.async_add_executor_job(
-                api.get_trips, act_station, arr_station
-            )
-        except Exception as err:
-            raise UpdateFailed(f"Fout bij ophalen NS data: {err}")
-
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        name=f"NS {act_station} -> {arr_station}",
-        update_method=async_update_data,
-        update_interval=timedelta(minutes=scan_interval),
-    )
+    # Gebruik nu de asynchrone coordinator uit coordinator.py!
+    coordinator = NSUpdateCoordinator(hass, api_key, act_station, arr_station)
 
     # Forceer de eerste verversing van data
     await coordinator.async_config_entry_first_refresh()
