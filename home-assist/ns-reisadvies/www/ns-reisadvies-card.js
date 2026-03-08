@@ -1,11 +1,23 @@
 class NSReisadviesCard extends HTMLElement {
   setConfig(config) {
-    this._config = { title: "NS Reisadvies", max_rows: 5, scale: 100, fav_slots: 1, ...config };
+    this._config = { title: "NS Reisadvies", max_rows: 5, scale: 100, fav_slots: 1, fav_hours: 6, ...config };
     
     // Tijdelijk werkgeheugen voor bliksemsnelle reacties op je kliks
     this._pendingTrack = new Set();
     this._pendingUntrack = new Set();
     this._autoPinned = new Set();
+
+    // Lokaal logboekje puur om de 'leeftijd' van een hartje bij te houden
+    this.lsKey = `ns_fav_times_${this._config.entity || 'default'}`;
+    try {
+      this.favTimestamps = JSON.parse(localStorage.getItem(this.lsKey)) || {};
+    } catch (e) {
+      this.favTimestamps = {};
+    }
+  }
+
+  saveTimestamps() {
+    localStorage.setItem(this.lsKey, JSON.stringify(this.favTimestamps));
   }
 
   static getConfigElement() { return document.createElement("ns-reisadvies-editor"); }
@@ -25,68 +37,129 @@ class NSReisadviesCard extends HTMLElement {
     }
   }
 
+  // --- HET OPSCHOON PROCES ---
+  cleanOldFavorites(serverTracked) {
+    if (!this._config.fav_hours) return; // Bij 0 uur (of leeg) doen we niks
+    
+    const limit = this._config.fav_hours * 60 * 60 * 1000;
+    const now = Date.now();
+    let changed = false;
+
+    // 1. Loop door de ritten die momenteel 'AAN' staan op de server
+    serverTracked.forEach(ctx => {
+      if (!this.favTimestamps[ctx]) {
+        // Aangezet door een ander apparaat? Dan start de timer nu hier.
+        this.favTimestamps[ctx] = now;
+        changed = true;
+      } else if (now - this.favTimestamps[ctx] > limit) {
+        // Verlooptijd bereikt! Stuur commando naar server om hem overal uit te zetten.
+        this._hass.callService("ns_reisadvies", "untrack_trip", {
+          entity_id: this._config.entity,
+          ctx_recon: ctx
+        }).catch(() => {});
+        
+        delete this.favTimestamps[ctx];
+        changed = true;
+      }
+    });
+
+    // 2. Ruim ritten op in het logboek die al lang niet meer op de server staan
+    for (let ctx in this.favTimestamps) {
+      if (!serverTracked.includes(ctx) && !this._pendingTrack.has(ctx)) {
+        delete this.favTimestamps[ctx];
+        changed = true;
+      }
+    }
+
+    if (changed) this.saveTimestamps();
+  }
+
   toggleFavorite(ctxRecon, isCurrentlyTracked, event) {
     event.stopPropagation();
     if (!ctxRecon || !this._hass || !this._config.entity) return;
 
     if (isCurrentlyTracked) {
-      // Zet UIT: Verberg direct en vertel het de server
       this._pendingUntrack.add(ctxRecon);
       this._pendingTrack.delete(ctxRecon);
+      delete this.favTimestamps[ctxRecon];
+      
       this._hass.callService("ns_reisadvies", "untrack_trip", {
         entity_id: this._config.entity,
         ctx_recon: ctxRecon
       });
     } else {
-      // Zet AAN: Toon direct en vertel het de server
       this._pendingTrack.add(ctxRecon);
       this._pendingUntrack.delete(ctxRecon);
+      this.favTimestamps[ctxRecon] = Date.now();
+      
       this._hass.callService("ns_reisadvies", "track_trip", {
         entity_id: this._config.entity,
         ctx_recon: ctxRecon
       });
     }
-    this.updateContent(); // Ververs het scherm direct
+    
+    this.saveTimestamps();
+    this.updateContent();
   }
 
   processAutoFavs(stateObj) {
     const trackedTrips = stateObj.attributes.tracked_trips || [];
-    const dag = new Date().getDay(); // 0 is zondag, 1 is maandag, etc.
+    const dag = new Date().getDay(); 
 
     for (let i = 1; i <= (this._config.fav_slots || 1); i++) {
       const h = this._config[`auto_hour_${i}`];
       const m = this._config[`auto_min_${i}`];
       const daysStr = this._config[`auto_days_${i}`] || "";
-      
-      // Veilig omzetten naar een lijst met getallen
       const activeDays = daysStr.split(',').filter(x => x !== "").map(Number);
 
       if (h !== undefined && m !== undefined && activeDays.includes(dag)) {
+        let bestTrip = null;
+        let minAbsDiff = Infinity;
+        let bestDiff = Infinity;
+        const favMinutes = parseInt(h) * 60 + parseInt(m);
+
         stateObj.attributes.trips.forEach(trip => {
           if (!trip.legs || !trip.legs[0] || !trip.ctxRecon) return;
           
           const tDate = new Date(trip.legs[0].origin.plannedDateTime);
           const tripMinutes = tDate.getHours() * 60 + tDate.getMinutes();
-          const favMinutes = parseInt(h) * 60 + parseInt(m);
 
-          // Ligt de trein binnen 15 minuten van de favoriete tijd?
-          if (Math.abs(tripMinutes - favMinutes) <= 15) {
-            
-            // Als hij nog niet op de server staat, EN we hebben hem niet al eerder doorgegeven
-            if (!trackedTrips.includes(trip.ctxRecon) && !this._autoPinned.has(trip.ctxRecon)) {
-              this._autoPinned.add(trip.ctxRecon);
-              this._pendingTrack.add(trip.ctxRecon); // Zet UI direct op rood
-              
-              this._hass.callService("ns_reisadvies", "track_trip", {
-                entity_id: this._config.entity,
-                ctx_recon: trip.ctxRecon
-              }).catch(() => {});
-              
-              // Forceer een snelle hertekening
-              setTimeout(() => this.updateContent(), 50);
+          let diff = tripMinutes - favMinutes;
+          if (diff < -720) diff += 1440;
+          if (diff > 720) diff -= 1440;
+
+          const absDiff = Math.abs(diff);
+
+          if (absDiff <= 60) {
+            if (absDiff < minAbsDiff) {
+              minAbsDiff = absDiff;
+              bestDiff = diff;
+              bestTrip = trip;
+            } else if (absDiff === minAbsDiff) {
+              if (diff < bestDiff) {
+                minAbsDiff = absDiff;
+                bestDiff = diff;
+                bestTrip = trip;
+              }
             }
           }
         });
+
+        if (bestTrip) {
+          if (!trackedTrips.includes(bestTrip.ctxRecon) && !this._autoPinned.has(bestTrip.ctxRecon)) {
+            this._autoPinned.add(bestTrip.ctxRecon);
+            this._pendingTrack.add(bestTrip.ctxRecon); 
+            this.favTimestamps[bestTrip.ctxRecon] = Date.now(); // Start de timer
+            this.saveTimestamps();
+            
+            this._hass.callService("ns_reisadvies", "track_trip", {
+              entity_id: this._config.entity,
+              ctx_recon: bestTrip.ctxRecon
+            }).catch(() => {});
+            
+            setTimeout(() => this.updateContent(), 50);
+          }
+        }
       }
     }
   }
@@ -144,13 +217,14 @@ class NSReisadviesCard extends HTMLElement {
       return;
     }
 
-    // Controleer op automatische tijd-favorieten
+    const serverTracked = stateObj.attributes.tracked_trips || [];
+    
+    // Roep de nieuwe opschoonfunctie aan!
+    this.cleanOldFavorites(serverTracked);
     this.processAutoFavs(stateObj);
 
     const allTrips = stateObj.attributes.trips || [];
-    const serverTracked = stateObj.attributes.tracked_trips || [];
 
-    // Verwijder 'pending' statussen als de server is bijgewerkt
     serverTracked.forEach(ctx => this._pendingTrack.delete(ctx));
     this._pendingUntrack.forEach(ctx => {
        if (!serverTracked.includes(ctx)) this._pendingUntrack.delete(ctx);
@@ -161,9 +235,7 @@ class NSReisadviesCard extends HTMLElement {
       let isFav = false;
       
       if (ctx) {
-        // Is hij rood op de server, en hebben we hem niet zojuist proberen uit te zetten?
         if (serverTracked.includes(ctx) && !this._pendingUntrack.has(ctx)) isFav = true;
-        // Of hebben we hem zojuist aangeklikt, maar is de server nog niet zo ver?
         if (this._pendingTrack.has(ctx)) isFav = true;
       }
       
@@ -287,7 +359,6 @@ class NSReisadviesCard extends HTMLElement {
     });
     this.content.innerHTML = html + `</div>`;
 
-    // Klik-functies koppelen
     const hearts = this.content.querySelectorAll(`.fav-heart`);
     hearts.forEach(btn => {
       const ctxRecon = btn.getAttribute('data-ctx');
@@ -318,11 +389,7 @@ class NSReisadviesEditor extends HTMLElement {
       <style>
         .box { background: rgba(128,128,128,0.1); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #FFC917; position: relative; }
         .time-row { display: flex; gap: 10px; margin: 15px 0; align-items: center; }
-        .select-styled { 
-          background: #2a2a2a !important; color: white !important; padding: 6px 8px !important; height: 38px !important;
-          border-radius: 6px !important; border: 1px solid #444 !important; font-size: 1.1em !important; font-weight: 500 !important;
-          cursor: pointer !important; min-width: 70px !important; text-align: center !important;
-        }
+        .select-styled { background: #2a2a2a !important; color: white !important; padding: 6px 8px !important; height: 38px !important; border-radius: 6px !important; border: 1px solid #444 !important; font-size: 1.1em !important; font-weight: 500 !important; cursor: pointer !important; min-width: 70px !important; text-align: center !important; }
         .day-grid { display: flex; justify-content: space-between; margin-top: 15px; }
         .day-unit { font-size: 0.85em; display: flex; flex-direction: column; align-items: center; gap: 5px; }
         .chk { width: 17px; height: 17px; cursor: pointer; }
@@ -332,28 +399,19 @@ class NSReisadviesEditor extends HTMLElement {
       </style>
       <div style="padding: 10px;">
         <ha-textfield label="Titel" id="title" style="width:100%; margin-bottom:20px;"></ha-textfield>
-        
         <label style="margin-bottom: 5px; display: block; font-size: 0.9em; opacity: 0.8;">Route Sensor</label>
         <select id="entity" style="width:100%; padding:10px; background:var(--card-background-color); color:inherit; margin-bottom:20px; border:1px solid var(--divider-color); border-radius: 6px;">
           ${entities.map(e => `<option value="${e}" ${e === this._config.entity ? "selected" : ""}>${e}</option>`).join('')}
         </select>
+        <div class="slider-row"><label class="slider-label">Aantal ritten <span class="val-span" id="val-rows">${curRows}</span></label><input type="range" id="max_rows" min="1" max="15" value="${curRows}" style="width:100%;"></div>
+        <div class="slider-row"><label class="slider-label">Schaal <span class="val-span" id="val-scale">${curScale}%</span></label><input type="range" id="scale" min="50" max="150" value="${curScale}" style="width:100%;"></div>
         
-        <div class="slider-row">
-           <label class="slider-label">Aantal ritten <span class="val-span" id="val-rows">${curRows}</span></label>
-           <input type="range" id="max_rows" min="1" max="15" value="${curRows}" style="width:100%;">
-        </div>
-
-        <div class="slider-row">
-           <label class="slider-label">Schaal <span class="val-span" id="val-scale">${curScale}%</span></label>
-           <input type="range" id="scale" min="50" max="150" value="${curScale}" style="width:100%;">
-        </div>
-
         <div class="slider-row" style="margin-bottom: 25px;">
            <label class="slider-label">Favorieten bewaren (uren) <span class="val-span" id="val-fav">${curFavH}</span></label>
            <input type="range" id="fav_hours" min="0" max="48" value="${curFavH}" style="width:100%;">
         </div>
 
-        <h3 style="margin-bottom: 12px; font-size: 1.1em;">Favoriete tijden</h3>`;
+        <h3 style="margin-bottom: 12px; font-size: 1.1em;">Favoriete tijden (Pint 1 rit)</h3>`;
 
     for (let i = 1; i <= slots; i++) {
       const activeDays = (this._config[`auto_days_${i}`] || "").split(',').filter(x => x !== "");
@@ -361,34 +419,19 @@ class NSReisadviesEditor extends HTMLElement {
         <div class="box">
           <ha-icon icon="mdi:delete" class="delete-slot" data-index="${i}" style="position: absolute; right: 10px; top: 10px; color: #ff5252; cursor: pointer; opacity: 0.7;"></ha-icon>
           <ha-textfield label="Naam" id="auto_name_${i}" .value="${this._config[`auto_name_${i}`] || 'Tijdslot ' + i}" style="width: calc(100% - 30px); margin-bottom: 5px;"></ha-textfield>
-          
           <div class="time-row">
             <span>Tijd:</span>
-            <select class="select-styled" id="auto_hour_${i}">
-              ${Array.from({length:24},(_, n)=>`<option value="${n.toString().padStart(2,'0')}" ${this._config[`auto_hour_${i}`]==n.toString().padStart(2,'0')?'selected':''}>${n.toString().padStart(2,'0')}</option>`).join('')}
-            </select>
+            <select class="select-styled" id="auto_hour_${i}">${Array.from({length:24},(_, n)=>`<option value="${n.toString().padStart(2,'0')}" ${this._config[`auto_hour_${i}`]==n.toString().padStart(2,'0')?'selected':''}>${n.toString().padStart(2,'0')}</option>`).join('')}</select>
             <span>:</span>
-            <select class="select-styled" id="auto_min_${i}">
-              ${Array.from({length:60},(_, n)=>`<option value="${n.toString().padStart(2,'0')}" ${this._config[`auto_min_${i}`]==n.toString().padStart(2,'0')?'selected':''}>${n.toString().padStart(2,'0')}</option>`).join('')}
-            </select>
+            <select class="select-styled" id="auto_min_${i}">${Array.from({length:60},(_, n)=>`<option value="${n.toString().padStart(2,'0')}" ${this._config[`auto_min_${i}`]==n.toString().padStart(2,'0')?'selected':''}>${n.toString().padStart(2,'0')}</option>`).join('')}</select>
           </div>
-          
           <div class="day-grid">
-            ${weekDays.map(day => `
-              <label class="day-unit">
-                <span>${day.label}</span>
-                <input type="checkbox" class="chk" data-index="${i}" data-day="${day.val}" ${activeDays.includes(day.val.toString()) ? 'checked' : ''}>
-              </label>
-            `).join('')}
+            ${weekDays.map(day => `<label class="day-unit"><span>${day.label}</span><input type="checkbox" class="chk" data-index="${i}" data-day="${day.val}" ${activeDays.includes(day.val.toString()) ? 'checked' : ''}></label>`).join('')}
           </div>
         </div>`;
     }
 
-    html += `
-      <button id="add-slot" style="width:100%; padding: 12px; background: #3b82f6; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 5px;">
-        + Favoriete tijd toevoegen
-      </button>
-    </div>`;
+    html += `<button id="add-slot" style="width:100%; padding: 12px; background: #3b82f6; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; margin-top: 5px;">+ Favoriete tijd toevoegen</button></div>`;
 
     this.innerHTML = html;
 
@@ -398,19 +441,11 @@ class NSReisadviesEditor extends HTMLElement {
         titleField.addEventListener('change', (ev) => this._fire({ title: ev.target.value }));
     }
 
-    this.querySelector('#add-slot').addEventListener('click', () => {
-      this._fire({ fav_slots: slots + 1 });
-      this.render();
-    });
-
-    this.querySelector('#max_rows').addEventListener('input', (e) => {
-        this.querySelector('#val-rows').innerText = e.target.value;
-        this._fire({ max_rows: parseInt(e.target.value) });
-    });
-    this.querySelector('#scale').addEventListener('input', (e) => {
-        this.querySelector('#val-scale').innerText = e.target.value + "%";
-        this._fire({ scale: parseInt(e.target.value) });
-    });
+    this.querySelector('#add-slot').addEventListener('click', () => { this._fire({ fav_slots: slots + 1 }); this.render(); });
+    this.querySelector('#max_rows').addEventListener('input', (e) => { this.querySelector('#val-rows').innerText = e.target.value; this._fire({ max_rows: parseInt(e.target.value) }); });
+    this.querySelector('#scale').addEventListener('input', (e) => { this.querySelector('#val-scale').innerText = e.target.value + "%"; this._fire({ scale: parseInt(e.target.value) }); });
+    
+    // EVENT LISTENER VOOR DE FAV UREN SLIDER
     this.querySelector('#fav_hours').addEventListener('input', (e) => {
         this.querySelector('#val-fav').innerText = e.target.value;
         this._fire({ fav_hours: parseInt(e.target.value) });
@@ -421,15 +456,9 @@ class NSReisadviesEditor extends HTMLElement {
         const idx = parseInt(btn.dataset.index);
         let newConfig = { ...this._config };
         for (let j = idx; j < slots; j++) {
-          newConfig[`auto_name_${j}`] = newConfig[`auto_name_${j+1}`];
-          newConfig[`auto_hour_${j}`] = newConfig[`auto_hour_${j+1}`];
-          newConfig[`auto_min_${j}`] = newConfig[`auto_min_${j+1}`];
-          newConfig[`auto_days_${j}`] = newConfig[`auto_days_${j+1}`];
+          newConfig[`auto_name_${j}`] = newConfig[`auto_name_${j+1}`]; newConfig[`auto_hour_${j}`] = newConfig[`auto_hour_${j+1}`]; newConfig[`auto_min_${j}`] = newConfig[`auto_min_${j+1}`]; newConfig[`auto_days_${j}`] = newConfig[`auto_days_${j+1}`];
         }
-        delete newConfig[`auto_name_${slots}`];
-        delete newConfig[`auto_hour_${slots}`];
-        delete newConfig[`auto_min_${slots}`];
-        delete newConfig[`auto_days_${slots}`];
+        delete newConfig[`auto_name_${slots}`]; delete newConfig[`auto_hour_${slots}`]; delete newConfig[`auto_min_${slots}`]; delete newConfig[`auto_days_${slots}`];
         newConfig.fav_slots = slots - 1;
         this._config = newConfig;
         this.dispatchEvent(new CustomEvent("config-changed", { detail: { config: newConfig } }));
